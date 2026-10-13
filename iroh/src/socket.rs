@@ -1025,7 +1025,9 @@ impl EndpointInner {
         let endpoint = noq::Endpoint::new_with_multiple_sockets(
             endpoint_config,
             Some(server_config),
-            transports.noq_sockets(sock.clone(), transport_recvs),
+            transports
+                .noq_sockets(sock.clone(), transport_recvs)
+                .map_err(|err| e!(BindError::CreateQuicEndpoint, err))?,
             runtime.clone(),
         )
         .map_err(|err| e!(BindError::CreateQuicEndpoint, err))?;

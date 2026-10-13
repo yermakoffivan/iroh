@@ -36,7 +36,7 @@ use custom::{CustomEndpoint, CustomSender, CustomTransport};
 #[cfg(not(wasm_browser))]
 pub(crate) use self::ip::Config as IpConfig;
 #[cfg(not(wasm_browser))]
-use self::ip::{IpNetworkChangeSender, IpTransport, IpTransports, IpTransportsSender};
+use self::ip::{IpNetworkChangeSender, IpSender, IpTransport, IpTransports, IpTransportsSender};
 pub(crate) use self::relay::{
     HomeRelayWatch, RelayActorConfig, RelayConnectionFailure, RelayConnectionState, RelayTransport,
 };
@@ -142,6 +142,30 @@ impl TransportRecv {
             #[cfg(not(wasm_browser))]
             Self::Ip(t) => t.max_receive_segments(),
             _ => NonZeroUsize::MIN,
+        }
+    }
+
+    /// Creates the sender for the noq socket of this transport.
+    ///
+    /// Only the mixed socket needs a sender over all transports, because the remote state
+    /// actor fans its transmits out. Every other socket only sends on its own transport.
+    /// Relay and custom sockets hold the senders of all transports of their kind, as they
+    /// share one mapped address range.
+    fn create_sender(&self, transports: &Transports) -> TransportSender {
+        match self {
+            #[cfg(not(wasm_browser))]
+            Self::Ip(t) => TransportSender::Ip(t.create_sender()),
+            Self::Relay(_) => {
+                TransportSender::Relay(transports.relay.iter().map(|t| t.create_sender()).collect())
+            }
+            Self::Custom(_) => TransportSender::Custom(
+                transports
+                    .custom
+                    .iter()
+                    .map(|t| t.lock().expect("poisoned").create_sender())
+                    .collect(),
+            ),
+            Self::Mixed => TransportSender::Mixed(transports.create_sender()),
         }
     }
 
@@ -487,13 +511,18 @@ impl Transports {
     }
 
     /// Creates the noq sockets for all transports, plus the [`TransportRecv::Mixed`] one.
+    ///
+    /// Fails if no transport is bound at all, as the endpoint could not reach anything.
     pub(crate) fn noq_sockets(
         self,
         sock: Arc<Socket>,
         recvs: Vec<TransportRecv>,
-    ) -> Vec<Box<dyn noq::AsyncUdpSocket>> {
+    ) -> io::Result<Vec<Box<dyn noq::AsyncUdpSocket>>> {
+        if recvs.is_empty() {
+            return Err(io::Error::other("no valid address available"));
+        }
         let transports = Arc::new(self);
-        recvs
+        let sockets = recvs
             .into_iter()
             .chain([TransportRecv::Mixed])
             .map(|recv| {
@@ -506,7 +535,8 @@ impl Transports {
                     recv_backoff: None,
                 }) as Box<dyn noq::AsyncUdpSocket>
             })
-            .collect()
+            .collect();
+        Ok(sockets)
     }
 }
 
@@ -1087,7 +1117,7 @@ impl noq::AsyncUdpSocket for Transport {
     fn create_sender(&self) -> Pin<Box<dyn noq::UdpSender>> {
         Box::pin(Sender {
             sock: self.sock.clone(),
-            sender: self.transports.create_sender(),
+            sender: self.recv.create_sender(&self.transports),
             max_transmit_segments: self.recv.max_transmit_segments(&self.transports),
         })
     }
@@ -1149,50 +1179,22 @@ impl noq::AsyncUdpSocket for Transport {
         self.recv.ip_ranges()
     }
 
-    #[cfg(not(wasm_browser))]
+    /// The local address of this socket's transport.
+    ///
+    /// noq uses it to pick the socket for a transmit with a source address, and to tell
+    /// link-local sockets apart by scope id. IP transports report their bound address.
+    /// The other transports have no IP address and report a fake IPv6 one, which also keeps
+    /// noq in IPv6 mode, as our mapped addresses need.
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        let local_addrs = self.transports.local_addrs();
-        let addrs: Vec<_> = local_addrs
-            .into_iter()
-            .map(|addr| {
-                use crate::socket::mapped_addrs::DEFAULT_FAKE_ADDR;
+        use crate::socket::mapped_addrs::DEFAULT_FAKE_ADDR;
 
-                match addr {
-                    Addr::Ip(addr) => addr,
-                    Addr::Relay(..) => DEFAULT_FAKE_ADDR.into(),
-                    Addr::Custom(_) => DEFAULT_FAKE_ADDR.into(),
-                }
-            })
-            .collect();
-
-        if let Some(addr) = addrs.iter().find(|addr| addr.is_ipv6()) {
-            return Ok(*addr);
+        match &self.recv {
+            #[cfg(not(wasm_browser))]
+            TransportRecv::Ip(t) => Ok(t.local_addr_watch().get()),
+            TransportRecv::Relay(_) | TransportRecv::Custom(_) | TransportRecv::Mixed => {
+                Ok(DEFAULT_FAKE_ADDR.into())
+            }
         }
-        if let Some(SocketAddr::V4(addr)) = addrs.first() {
-            // Pretend to be IPv6, because our `MappedAddr`s need to be IPv6.
-            let ip = addr.ip().to_ipv6_mapped().into();
-            return Ok(SocketAddr::new(ip, addr.port()));
-        }
-
-        if !self.transports.relay.is_empty() {
-            // pretend we have an address to make sure things are not too sad during startup
-            use crate::socket::mapped_addrs::DEFAULT_FAKE_ADDR;
-
-            return Ok(DEFAULT_FAKE_ADDR.into());
-        }
-        if !self.transports.custom.is_empty() {
-            // pretend we have an address to make sure things are not too sad during startup
-            use crate::socket::mapped_addrs::DEFAULT_FAKE_ADDR;
-
-            return Ok(DEFAULT_FAKE_ADDR.into());
-        }
-        Err(io::Error::other("no valid address available"))
-    }
-
-    #[cfg(wasm_browser)]
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        // Again, we need to pretend we're IPv6, because of our `MappedAddr`s.
-        Ok(SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), 0))
     }
 
     fn max_receive_segments(&self) -> NonZeroUsize {
@@ -1204,17 +1206,82 @@ impl noq::AsyncUdpSocket for Transport {
     }
 }
 
+/// The transport side of a [`Sender`], see [`TransportRecv::create_sender`]
+#[derive(Debug)]
+enum TransportSender {
+    #[cfg(not(wasm_browser))]
+    Ip(IpSender),
+    Relay(Vec<RelaySender>),
+    Custom(Vec<Arc<dyn CustomSender>>),
+    /// Sends on every transport, for [`MultipathMappedAddr::Mixed`] destinations
+    Mixed(TransportsSender),
+}
+
+impl TransportSender {
+    fn poll_send(
+        &mut self,
+        cx: &mut Context,
+        network_path: &FourTuple,
+        transmit: &Transmit<'_>,
+    ) -> Poll<io::Result<()>> {
+        match (self, network_path) {
+            #[cfg(not(wasm_browser))]
+            (Self::Ip(sender), FourTuple::Ip { remote, local }) => {
+                return Pin::new(sender).poll_send(cx, *remote, *local, transmit);
+            }
+            (Self::Relay(senders), FourTuple::Relay { url, endpoint_id }) => {
+                let mut has_valid_sender = false;
+                for sender in senders
+                    .iter_mut()
+                    .filter(|s| s.is_valid_send_addr(url, endpoint_id))
+                {
+                    has_valid_sender = true;
+                    match sender.poll_send(cx, url.clone(), *endpoint_id, transmit) {
+                        Poll::Pending => {}
+                        Poll::Ready(res) => return Poll::Ready(res),
+                    }
+                }
+                if has_valid_sender {
+                    return Poll::Pending;
+                }
+            }
+            (Self::Custom(senders), FourTuple::Custom { remote, local }) => {
+                let mut has_valid_sender = false;
+                for sender in senders.iter().filter(|s| s.is_valid_send_addr(remote)) {
+                    has_valid_sender = true;
+                    match sender.poll_send(cx, remote, local.as_ref(), transmit) {
+                        Poll::Pending => {}
+                        Poll::Ready(res) => return Poll::Ready(res),
+                    }
+                }
+                if has_valid_sender {
+                    return Poll::Pending;
+                }
+            }
+            (Self::Mixed(sender), _) => {
+                return Pin::new(sender).poll_send(cx, network_path, transmit);
+            }
+            // noq routed this destination to a socket whose transport cannot reach it, e.g. a
+            // relay address while no relay transport is configured.
+            _ => {}
+        }
+
+        // We "blackhole" data that we have not found any usable transport for on
+        // to make sure the QUIC stack picks up that currently this data does not arrive.
+        trace!(%network_path, "no valid transport available");
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// A sender for [`Transport`].
 ///
 /// This is special in that it handles [`MultipathMappedAddr::Mixed`] by delegating to the
 /// [`Socket`] which expands it back to one or more [`Addr`]s and sends it
 /// using the underlying [`Transports`].
 #[derive(Debug)]
-#[pin_project::pin_project]
 pub(crate) struct Sender {
     sock: Arc<Socket>,
-    #[pin]
-    sender: TransportsSender,
+    sender: TransportSender,
     /// The limit of the transport this sender belongs to, see
     /// [`TransportRecv::max_transmit_segments`].
     max_transmit_segments: NonZeroUsize,
@@ -1268,10 +1335,14 @@ impl noq::UdpSender for Sender {
                         "oops, flub didn't think this would happen");
                 }
 
+                let TransportSender::Mixed(fan_out) = &self.sender else {
+                    error!(dst = ?mapped_addr, "NodeIdMappedAddr routed to a plain transport, dropped transmit");
+                    return Poll::Ready(Ok(()));
+                };
                 match self.sock.try_send_remote_state_msg(
                     endpoint_id,
                     super::RemoteStateMessage::SendDatagram(
-                        Box::new(self.sender.clone()),
+                        Box::new(fan_out.clone()),
                         OwnedTransmit::from(noq_transmit),
                     ),
                 ) {
@@ -1347,7 +1418,7 @@ impl noq::UdpSender for Sender {
             contents: noq_transmit.contents,
             segment_size: noq_transmit.segment_size,
         };
-        let this = self.project();
+        let this = self.get_mut();
 
         match this.sender.poll_send(cx, &network_path, &transmit) {
             Poll::Ready(Ok(())) => {
