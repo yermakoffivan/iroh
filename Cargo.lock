@@ -3153,7 +3153,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 [[package]]
 name = "noq"
 version = "1.3.0"
-source = "git+https://github.com/n0-computer/noq?branch=feat%2Fmulti-socket#848153aaa602b30f4b53e988a5c59e9dd77fb8fd"
+source = "git+https://github.com/n0-computer/noq?branch=feat%2Fmulti-socket#7470dea7dfb044049fae59a7a962d27930658ba2"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3175,7 +3175,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.3.0"
-source = "git+https://github.com/n0-computer/noq?branch=feat%2Fmulti-socket#848153aaa602b30f4b53e988a5c59e9dd77fb8fd"
+source = "git+https://github.com/n0-computer/noq?branch=feat%2Fmulti-socket#7470dea7dfb044049fae59a7a962d27930658ba2"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -3205,7 +3205,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.3.0"
-source = "git+https://github.com/n0-computer/noq?branch=feat%2Fmulti-socket#848153aaa602b30f4b53e988a5c59e9dd77fb8fd"
+source = "git+https://github.com/n0-computer/noq?branch=feat%2Fmulti-socket#7470dea7dfb044049fae59a7a962d27930658ba2"
 dependencies = [
  "cfg_aliases",
  "libc",

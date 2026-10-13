@@ -69,6 +69,10 @@ pub(crate) struct Transports {
     ip: IpTransports,
     relay: Vec<RelayTransport>,
     /// Shared with the [`TransportRecv::Custom`] that polls it.
+    ///
+    /// `CustomEndpoint::poll_recv` takes `&mut self` while `create_sender` and
+    /// `watch_local_addrs` take `&self`, and they run on different tasks, hence the lock.
+    /// The receive task takes it once per batch, the others only on connect and setup.
     custom: Vec<Arc<Mutex<Box<dyn CustomEndpoint>>>>,
 }
 
@@ -138,6 +142,21 @@ impl TransportRecv {
             #[cfg(not(wasm_browser))]
             Self::Ip(t) => t.max_receive_segments(),
             _ => NonZeroUsize::MIN,
+        }
+    }
+
+    /// The segmentation limit for transmits noq routes to this transport.
+    ///
+    /// IP and custom transports answer for themselves, so a GSO socket is not held to the
+    /// limit of a transport without GSO. Relay and the mixed socket keep the limit across
+    /// all transports: relay batches are re-split by the actor, and mixed transmits are
+    /// fanned out to every transport.
+    fn max_transmit_segments(&self, transports: &Transports) -> NonZeroUsize {
+        match self {
+            #[cfg(not(wasm_browser))]
+            Self::Ip(t) => t.max_transmit_segments(),
+            Self::Custom(t) => t.lock().expect("poisoned").max_transmit_segments(),
+            Self::Relay(_) | Self::Mixed => transports.max_transmit_segments(),
         }
     }
 
@@ -441,14 +460,12 @@ impl Transports {
             .iter()
             .map(|t| t.lock().expect("poisoned").create_sender())
             .collect();
-        let max_transmit_segments = self.max_transmit_segments();
 
         TransportsSender {
             #[cfg(not(wasm_browser))]
             ip,
             relay,
             custom,
-            max_transmit_segments,
         }
     }
 
@@ -953,7 +970,6 @@ pub(crate) struct TransportsSender {
     ip: IpTransportsSender,
     relay: Vec<RelaySender>,
     custom: Vec<Arc<dyn CustomSender>>,
-    max_transmit_segments: NonZeroUsize,
 }
 
 impl TransportsSender {
@@ -1072,6 +1088,7 @@ impl noq::AsyncUdpSocket for Transport {
         Box::pin(Sender {
             sock: self.sock.clone(),
             sender: self.transports.create_sender(),
+            max_transmit_segments: self.recv.max_transmit_segments(&self.transports),
         })
     }
 
@@ -1198,6 +1215,9 @@ pub(crate) struct Sender {
     sock: Arc<Socket>,
     #[pin]
     sender: TransportsSender,
+    /// The limit of the transport this sender belongs to, see
+    /// [`TransportRecv::max_transmit_segments`].
+    max_transmit_segments: NonZeroUsize,
 }
 
 impl Sender {
@@ -1354,7 +1374,7 @@ impl noq::UdpSender for Sender {
     }
 
     fn max_transmit_segments(&self) -> NonZeroUsize {
-        self.sender.max_transmit_segments
+        self.max_transmit_segments
     }
 }
 
@@ -1379,7 +1399,6 @@ mod tests {
                     .create_sender(),
                 relay: vec![sender],
                 custom: Vec::new(),
-                max_transmit_segments: NonZeroUsize::new(1).unwrap(),
             };
             (
                 sender,
