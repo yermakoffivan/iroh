@@ -39,12 +39,6 @@ pub(crate) struct RelayTransport {
     my_endpoint_id: EndpointId,
 }
 
-impl std::fmt::Display for RelayTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RelayTransport")
-    }
-}
-
 /// The receive half of a [`RelayTransport`], driven by its own noq socket task.
 #[derive(Debug)]
 pub(crate) struct RelayRecv {

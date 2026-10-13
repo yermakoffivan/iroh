@@ -386,7 +386,7 @@ impl IpSender {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct IpTransportsSender {
     /// Stored sorted by prefix len
     v4: Vec<IpSender>,
@@ -397,6 +397,23 @@ pub(super) struct IpTransportsSender {
 }
 
 impl IpTransportsSender {
+    /// A sender over one transport only, for the noq socket of that transport.
+    pub(super) fn single(sender: IpSender) -> Self {
+        let default_index = sender.config.is_default().then_some(0);
+        match sender.config {
+            Config::V4 { .. } => Self {
+                v4: vec![sender],
+                default_v4_index: default_index,
+                ..Self::default()
+            },
+            Config::V6 { .. } => Self {
+                v6: vec![sender],
+                default_v6_index: default_index,
+                ..Self::default()
+            },
+        }
+    }
+
     pub(super) fn v4_iter_mut(&mut self) -> impl Iterator<Item = &mut IpSender> {
         self.v4.iter_mut()
     }
