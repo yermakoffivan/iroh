@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use n0_watcher::Watchable;
 use netwatch::{UdpSender, UdpSocket};
 use pin_project::pin_project;
@@ -16,7 +16,7 @@ use tracing::{debug, info, trace};
 use super::{RecvInfo, Transmit};
 use crate::metrics::{EndpointMetrics, SocketMetrics};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct IpTransport {
     config: Config,
     socket: Arc<UdpSocket>,
@@ -84,6 +84,33 @@ impl Config {
         match self {
             Self::V4 { is_default, .. } => *is_default,
             Self::V6 { is_default, .. } => *is_default,
+        }
+    }
+
+    /// The destination ranges this transport sends to, see [`noq::AsyncUdpSocket::ip_ranges`].
+    ///
+    /// A default transport also takes every destination of its address family, matching
+    /// [`Config::is_valid_default_addr`].
+    pub(crate) fn ip_ranges(&self) -> Vec<IpNet> {
+        match self {
+            Self::V4 {
+                ip_net, is_default, ..
+            } => {
+                let mut ranges = vec![IpNet::V4(*ip_net)];
+                if *is_default {
+                    ranges.push(IpNet::V4(Ipv4Net::default()));
+                }
+                ranges
+            }
+            Self::V6 {
+                ip_net, is_default, ..
+            } => {
+                let mut ranges = vec![IpNet::V6(*ip_net)];
+                if *is_default {
+                    ranges.push(IpNet::V6(Ipv6Net::default()));
+                }
+                ranges
+            }
         }
     }
 
@@ -248,6 +275,11 @@ impl IpTransport {
 
     pub(crate) fn bind_addr(&self) -> SocketAddr {
         self.config.into()
+    }
+
+    /// See [`Config::ip_ranges`].
+    pub(super) fn ip_ranges(&self) -> Vec<IpNet> {
+        self.config.ip_ranges()
     }
 
     pub(super) fn create_network_change_sender(&self) -> IpNetworkChangeSender {
@@ -470,10 +502,6 @@ impl IpTransports {
             v6: ip_v6,
             default_v6_index,
         })
-    }
-
-    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut IpTransport> {
-        self.v4.iter_mut().chain(self.v6.iter_mut())
     }
 }
 
