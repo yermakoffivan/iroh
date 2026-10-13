@@ -971,25 +971,20 @@ impl EndpointInner {
 
         let direct_addrs = DiscoveredDirectAddrs::default();
 
-        let remote_map = {
-            RemoteMap::new(
-                metrics.socket.clone(),
-                direct_addrs.addrs.watch(),
-                address_lookup.clone(),
-                shutdown_token.child_token(),
-                path_selector,
-                span.clone(),
-            )
-        };
+        // Shared between the socket and the remote map, which needs the noq endpoint and
+        // is therefore created after the socket.
+        let mapped_addrs = MappedAddrs::default();
+        let remote_actors = concurrent_read_map::ConcurrentReadMap::default();
+        let local_direct_addrs = direct_addrs.addrs.watch();
 
         let home_relay_watch = transports.home_relay_watch();
 
         let sock = Arc::new(Socket {
-            remote_actors: remote_map.senders(),
+            remote_actors: remote_actors.read_only(),
             shutdown: shutdown_state,
             ipv6_reported,
-            mapped_addrs: remote_map.mapped_addrs.clone(),
-            address_lookup,
+            mapped_addrs: mapped_addrs.clone(),
+            address_lookup: address_lookup.clone(),
             relay_map: relay_map.clone(),
             address_lookup_user_data: RwLock::new(address_lookup_user_data),
             configured_addrs: RwLock::new(configured_addrs),
@@ -1031,6 +1026,21 @@ impl EndpointInner {
             runtime.clone(),
         )
         .map_err(|err| e!(BindError::CreateQuicEndpoint, err))?;
+
+        let remote_map = RemoteMap::new(
+            mapped_addrs,
+            remote_actors,
+            Arc::new({
+                let endpoint = endpoint.clone();
+                move || endpoint.create_sender()
+            }),
+            metrics.socket.clone(),
+            local_direct_addrs,
+            address_lookup.clone(),
+            shutdown_token.child_token(),
+            path_selector,
+            span.clone(),
+        );
 
         let network_monitor = netmon::Monitor::new()
             .await

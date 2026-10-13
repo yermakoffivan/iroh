@@ -71,14 +71,6 @@ impl Config {
         matches!(self, | Self::V6 { .. })
     }
 
-    /// Returns the prefix len for the address.
-    pub(crate) fn prefix_len(&self) -> u8 {
-        match self {
-            Self::V4 { ip_net, .. } => ip_net.prefix_len(),
-            Self::V6 { ip_net, .. } => ip_net.prefix_len(),
-        }
-    }
-
     /// Is this a default config?
     pub(crate) fn is_default(&self) -> bool {
         match self {
@@ -119,61 +111,6 @@ impl Config {
         match self {
             Self::V4 { is_required, .. } => *is_required,
             Self::V6 { is_required, .. } => *is_required,
-        }
-    }
-
-    pub(crate) fn is_valid_default_addr(&self, src: Option<IpAddr>, dst: SocketAddr) -> bool {
-        match src {
-            Some(src) => match (self, src) {
-                (Self::V4 { is_default, .. }, IpAddr::V4(_)) => *is_default,
-                (Self::V6 { is_default, .. }, IpAddr::V6(_)) => *is_default,
-                _ => false,
-            },
-            None => match (self, dst) {
-                (Self::V4 { is_default, .. }, SocketAddr::V4(_)) => *is_default,
-                (Self::V6 { is_default, .. }, SocketAddr::V6(_)) => *is_default,
-                _ => false,
-            },
-        }
-    }
-
-    /// Does this configuration match to send to the given `src` and `dst` address.
-    pub(crate) fn is_valid_send_addr(&self, src: Option<IpAddr>, dst: SocketAddr) -> bool {
-        match src {
-            Some(src) => match (self, src) {
-                (Self::V4 { ip_net, .. }, IpAddr::V4(src)) => {
-                    ip_net.addr().is_unspecified() || ip_net.addr() == src
-                }
-                (Self::V6 { ip_net, .. }, IpAddr::V6(src)) => {
-                    ip_net.addr().is_unspecified() || ip_net.addr() == src
-                }
-                _ => false,
-            },
-            None => {
-                match (self, dst) {
-                    (Self::V4 { ip_net, .. }, SocketAddr::V4(dst_v4)) => {
-                        ip_net.contains(dst_v4.ip())
-                    }
-                    (
-                        Self::V6 {
-                            ip_net, scope_id, ..
-                        },
-                        SocketAddr::V6(dst_v6),
-                    ) => {
-                        if ip_net.contains(dst_v6.ip()) {
-                            return true;
-                        }
-                        if dst_v6.ip().is_unicast_link_local() {
-                            // If we have a link local interface, use the scope id
-                            if *scope_id == dst_v6.scope_id() {
-                                return true;
-                            }
-                        }
-                        false
-                    }
-                    _ => false,
-                }
-            }
         }
     }
 }
@@ -331,14 +268,6 @@ pub(super) struct IpSender {
 }
 
 impl IpSender {
-    pub(super) fn is_valid_send_addr(&self, src: Option<IpAddr>, dst: &SocketAddr) -> bool {
-        self.config.is_valid_send_addr(src, *dst)
-    }
-
-    pub(super) fn is_valid_default_addr(&self, src: Option<IpAddr>, dst: &SocketAddr) -> bool {
-        self.config.is_valid_default_addr(src, *dst)
-    }
-
     /// Creates a canonical socket address.
     ///
     /// We may be asked to send IPv4-mapped IPv6 addresses.  But our sockets are configured
@@ -386,80 +315,13 @@ impl IpSender {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(super) struct IpTransportsSender {
-    /// Stored sorted by prefix len
-    v4: Vec<IpSender>,
-    default_v4_index: Option<usize>,
-    /// Stored sorted by prefix len
-    v6: Vec<IpSender>,
-    default_v6_index: Option<usize>,
-}
-
-impl IpTransportsSender {
-    /// A sender over one transport only, for the noq socket of that transport.
-    pub(super) fn single(sender: IpSender) -> Self {
-        let default_index = sender.config.is_default().then_some(0);
-        match sender.config {
-            Config::V4 { .. } => Self {
-                v4: vec![sender],
-                default_v4_index: default_index,
-                ..Self::default()
-            },
-            Config::V6 { .. } => Self {
-                v6: vec![sender],
-                default_v6_index: default_index,
-                ..Self::default()
-            },
-        }
-    }
-
-    pub(super) fn v4_iter_mut(&mut self) -> impl Iterator<Item = &mut IpSender> {
-        self.v4.iter_mut()
-    }
-
-    pub(super) fn v4_default_mut(&mut self) -> Option<&mut IpSender> {
-        if let Some(i) = self.default_v4_index {
-            return Some(&mut self.v4[i]);
-        }
-        None
-    }
-
-    pub(super) fn v6_iter_mut(&mut self) -> impl Iterator<Item = &mut IpSender> {
-        self.v6.iter_mut()
-    }
-
-    pub(super) fn v6_default_mut(&mut self) -> Option<&mut IpSender> {
-        if let Some(i) = self.default_v6_index {
-            return Some(&mut self.v6[i]);
-        }
-        None
-    }
-}
-
+/// The bound IP transports.
 #[derive(Debug)]
-pub(super) struct IpTransports {
-    v4: Vec<IpTransport>,
-    default_v4_index: Option<usize>,
-    v6: Vec<IpTransport>,
-    default_v6_index: Option<usize>,
-}
+pub(super) struct IpTransports(Vec<IpTransport>);
 
 impl IpTransports {
-    pub(super) fn create_sender(&self) -> IpTransportsSender {
-        let ip_v4 = self.v4.iter().map(|t| t.create_sender()).collect();
-        let ip_v6 = self.v6.iter().map(|t| t.create_sender()).collect();
-
-        IpTransportsSender {
-            v4: ip_v4,
-            default_v4_index: self.default_v4_index,
-            v6: ip_v6,
-            default_v6_index: self.default_v6_index,
-        }
-    }
-
     pub(super) fn iter(&self) -> impl Iterator<Item = &IpTransport> {
-        self.v4.iter().chain(self.v6.iter())
+        self.0.iter()
     }
 
     pub(super) fn bind(
@@ -467,35 +329,26 @@ impl IpTransports {
         metrics: &EndpointMetrics,
     ) -> io::Result<Self> {
         let mut has_v4_default = false;
-        let mut ip_v4 = Vec::new();
-
         let mut has_v6_default = false;
-        let mut ip_v6 = Vec::new();
+        let mut transports = Vec::new();
 
         for config in configs {
             match IpTransport::bind(config, metrics.socket.clone()) {
                 Ok(transport) => {
-                    if config.is_ipv4() {
-                        if config.is_default() {
-                            if has_v4_default {
-                                return Err(io::Error::other(
-                                    "can only have a single IPv4 default transport",
-                                ));
-                            }
-                            has_v4_default = true;
+                    if config.is_default() {
+                        let has_default = if config.is_ipv4() {
+                            &mut has_v4_default
+                        } else {
+                            &mut has_v6_default
+                        };
+                        if *has_default {
+                            return Err(io::Error::other(
+                                "can only have a single default transport per address family",
+                            ));
                         }
-                        ip_v4.push(transport);
-                    } else if config.is_ipv6() {
-                        if config.is_default() {
-                            if has_v6_default {
-                                return Err(io::Error::other(
-                                    "can only have a single IPv6 default transport",
-                                ));
-                            }
-                            has_v6_default = true;
-                        }
-                        ip_v6.push(transport);
+                        *has_default = true;
                     }
+                    transports.push(transport);
                 }
                 Err(err) => {
                     if config.is_required() {
@@ -506,19 +359,7 @@ impl IpTransports {
             }
         }
 
-        // Sort in descending order by prefix len
-        ip_v4.sort_by_key(|i| std::cmp::Reverse(i.config.prefix_len()));
-        ip_v6.sort_by_key(|i| std::cmp::Reverse(i.config.prefix_len()));
-
-        let default_v4_index = ip_v4.iter().position(|i| i.config.is_default());
-        let default_v6_index = ip_v6.iter().position(|i| i.config.is_default());
-
-        Ok(Self {
-            v4: ip_v4,
-            default_v4_index,
-            v6: ip_v6,
-            default_v6_index,
-        })
+        Ok(Self(transports))
     }
 }
 
@@ -527,7 +368,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_bind_sorting() -> n0_error::Result {
+    async fn test_bind() -> n0_error::Result {
         let has_ipv6 = tokio::net::UdpSocket::bind("[::1]:0").await.is_ok();
         eprintln!("testing with ipv6? {has_ipv6}");
 
@@ -575,19 +416,8 @@ mod tests {
         ];
 
         let transports = IpTransports::bind(config.into_iter(), &metrics)?;
-        assert_eq!(transports.v4[0].config.prefix_len(), 24);
-        assert_eq!(transports.v4[1].config.prefix_len(), 8);
-        assert_eq!(transports.v4[2].config.prefix_len(), 0);
-
-        assert_eq!(transports.default_v4_index, Some(0));
-
-        if has_ipv6 {
-            assert_eq!(transports.v6[0].config.prefix_len(), 32);
-            assert_eq!(transports.v6[1].config.prefix_len(), 4);
-            assert_eq!(transports.v6[2].config.prefix_len(), 2);
-
-            assert_eq!(transports.default_v6_index, Some(2));
-        }
+        let expected = if has_ipv6 { 6 } else { 3 };
+        assert_eq!(transports.iter().count(), expected);
         Ok(())
     }
 }

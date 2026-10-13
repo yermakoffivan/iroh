@@ -16,7 +16,7 @@ use n0_future::time::{Duration, Sleep};
 use n0_watcher::Watcher;
 use relay::{RelayNetworkChangeSender, RelayRecv, RelaySender};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use super::{Socket, mapped_addrs::MultipathMappedAddr};
 use crate::{
@@ -36,7 +36,7 @@ use custom::{CustomEndpoint, CustomSender, CustomTransport};
 #[cfg(not(wasm_browser))]
 pub(crate) use self::ip::Config as IpConfig;
 #[cfg(not(wasm_browser))]
-use self::ip::{IpNetworkChangeSender, IpTransport, IpTransports, IpTransportsSender};
+use self::ip::{IpNetworkChangeSender, IpSender, IpTransport, IpTransports};
 pub(crate) use self::relay::{
     HomeRelayWatch, RelayActorConfig, RelayConnectionFailure, RelayConnectionState, RelayTransport,
 };
@@ -147,36 +147,24 @@ impl TransportRecv {
 
     /// Creates the sender for the noq socket of this transport.
     ///
-    /// Only the mixed socket needs a sender over all transports, because the remote state
-    /// actor fans its transmits out. Every other socket only holds the senders of its own
-    /// transport kind. Relay and custom sockets hold all transports of their kind, as those
-    /// share one mapped address range. Destinations noq routes to a socket whose sender has
-    /// no transport for them fall into [`TransportsSender::poll_send`]'s blackhole.
-    fn create_sender(&self, transports: &Transports) -> TransportsSender {
+    /// Relay and custom sockets hold the senders of all transports of their kind, as those
+    /// share one mapped address range. The mixed socket does not send itself: its transmits
+    /// go to the remote state actor, which sends through noq again.
+    fn create_sender(&self, transports: &Transports) -> TransportSender {
         match self {
             #[cfg(not(wasm_browser))]
-            Self::Ip(t) => TransportsSender {
-                ip: IpTransportsSender::single(t.create_sender()),
-                relay: Vec::new(),
-                custom: Vec::new(),
-            },
-            Self::Relay(_) => TransportsSender {
-                #[cfg(not(wasm_browser))]
-                ip: IpTransportsSender::default(),
-                relay: transports.relay.iter().map(|t| t.create_sender()).collect(),
-                custom: Vec::new(),
-            },
-            Self::Custom(_) => TransportsSender {
-                #[cfg(not(wasm_browser))]
-                ip: IpTransportsSender::default(),
-                relay: Vec::new(),
-                custom: transports
+            Self::Ip(t) => TransportSender::Ip(t.create_sender()),
+            Self::Relay(_) => {
+                TransportSender::Relay(transports.relay.iter().map(|t| t.create_sender()).collect())
+            }
+            Self::Custom(_) => TransportSender::Custom(
+                transports
                     .custom
                     .iter()
                     .map(|t| t.lock().expect("poisoned").create_sender())
                     .collect(),
-            },
-            Self::Mixed => transports.create_sender(),
+            ),
+            Self::Mixed => TransportSender::Mixed,
         }
     }
 
@@ -483,25 +471,6 @@ impl Transports {
             .map(|t| t.lock().expect("poisoned").max_transmit_segments())
             .min()
             .unwrap_or(NonZeroUsize::MIN)
-    }
-
-    pub(crate) fn create_sender(&self) -> TransportsSender {
-        #[cfg(not(wasm_browser))]
-        let ip = self.ip.create_sender();
-
-        let relay = self.relay.iter().map(|t| t.create_sender()).collect();
-        let custom = self
-            .custom
-            .iter()
-            .map(|t| t.lock().expect("poisoned").create_sender())
-            .collect();
-
-        TransportsSender {
-            #[cfg(not(wasm_browser))]
-            ip,
-            relay,
-            custom,
-        }
     }
 
     /// Handles potential changes to the underlying network conditions.
@@ -1004,66 +973,32 @@ impl fmt::Display for FourTuple {
     }
 }
 
-/// A sender that sends to all our transports.
-#[derive(Debug, Clone)]
-pub(crate) struct TransportsSender {
+/// The transport side of a [`Sender`], see [`TransportRecv::create_sender`]
+#[derive(Debug)]
+enum TransportSender {
     #[cfg(not(wasm_browser))]
-    ip: IpTransportsSender,
-    relay: Vec<RelaySender>,
-    custom: Vec<Arc<dyn CustomSender>>,
+    Ip(IpSender),
+    Relay(Vec<RelaySender>),
+    Custom(Vec<Arc<dyn CustomSender>>),
+    /// Only forwards to the remote state actor, see [`Sender::poll_send`]
+    Mixed,
 }
 
-impl TransportsSender {
-    #[instrument(name = "poll_send", skip(self, cx, transmit), fields(len = transmit.contents.len()))]
-    pub(crate) fn poll_send(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context,
+impl TransportSender {
+    fn poll_send(
+        &mut self,
+        cx: &mut Context,
         network_path: &FourTuple,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
-        match network_path {
-            #[cfg(wasm_browser)]
-            FourTuple::Ip { .. } => {
-                return Poll::Ready(Err(io::Error::other("IP is unsupported in browser")));
-            }
+        match (self, network_path) {
             #[cfg(not(wasm_browser))]
-            FourTuple::Ip {
-                remote: dst_addr,
-                local: src,
-            } => match dst_addr {
-                SocketAddr::V4(_) => {
-                    if let Some(sender) = self
-                        .ip
-                        .v4_iter_mut()
-                        .find(|s| s.is_valid_send_addr(*src, dst_addr))
-                    {
-                        return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
-                    }
-                    if let Some(sender) = self.ip.v4_default_mut()
-                        && sender.is_valid_default_addr(*src, dst_addr)
-                    {
-                        return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
-                    }
-                }
-                SocketAddr::V6(_) => {
-                    if let Some(sender) = self
-                        .ip
-                        .v6_iter_mut()
-                        .find(|s| s.is_valid_send_addr(*src, dst_addr))
-                    {
-                        return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
-                    }
-                    if let Some(sender) = self.ip.v6_default_mut()
-                        && sender.is_valid_default_addr(*src, dst_addr)
-                    {
-                        return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
-                    }
-                }
-            },
-            FourTuple::Relay { url, endpoint_id } => {
+            (Self::Ip(sender), FourTuple::Ip { remote, local }) => {
+                return Pin::new(sender).poll_send(cx, *remote, *local, transmit);
+            }
+            (Self::Relay(senders), FourTuple::Relay { url, endpoint_id }) => {
                 let mut has_valid_sender = false;
-                for sender in self
-                    .relay
+                for sender in senders
                     .iter_mut()
                     .filter(|s| s.is_valid_send_addr(url, endpoint_id))
                 {
@@ -1077,21 +1012,22 @@ impl TransportsSender {
                     return Poll::Pending;
                 }
             }
-            FourTuple::Custom { remote, local } => {
+            (Self::Custom(senders), FourTuple::Custom { remote, local }) => {
                 let mut has_valid_sender = false;
-                for sender in &mut self.custom {
-                    if sender.is_valid_send_addr(remote) {
-                        has_valid_sender = true;
-                        match sender.poll_send(cx, remote, local.as_ref(), transmit) {
-                            Poll::Pending => {}
-                            Poll::Ready(res) => return Poll::Ready(res),
-                        }
+                for sender in senders.iter().filter(|s| s.is_valid_send_addr(remote)) {
+                    has_valid_sender = true;
+                    match sender.poll_send(cx, remote, local.as_ref(), transmit) {
+                        Poll::Pending => {}
+                        Poll::Ready(res) => return Poll::Ready(res),
                     }
                 }
                 if has_valid_sender {
                     return Poll::Pending;
                 }
             }
+            // noq routed this destination to a socket whose transport cannot reach it, e.g. a
+            // relay address while no relay transport is configured.
+            _ => {}
         }
 
         // We "blackhole" data that we have not found any usable transport for on
@@ -1223,11 +1159,9 @@ impl noq::AsyncUdpSocket for Transport {
 /// [`Socket`] which expands it back to one or more [`Addr`]s and sends it
 /// using the underlying [`Transports`].
 #[derive(Debug)]
-#[pin_project::pin_project]
 pub(crate) struct Sender {
     sock: Arc<Socket>,
-    #[pin]
-    sender: TransportsSender,
+    sender: TransportSender,
     /// The limit of the transport this sender belongs to, see
     /// [`TransportRecv::max_transmit_segments`].
     max_transmit_segments: NonZeroUsize,
@@ -1283,10 +1217,7 @@ impl noq::UdpSender for Sender {
 
                 match self.sock.try_send_remote_state_msg(
                     endpoint_id,
-                    super::RemoteStateMessage::SendDatagram(
-                        Box::new(self.sender.clone()),
-                        OwnedTransmit::from(noq_transmit),
-                    ),
+                    super::RemoteStateMessage::SendDatagram(OwnedTransmit::from(noq_transmit)),
                 ) {
                     Ok(()) => {
                         trace!(dst = ?mapped_addr, dst_endpoint = %endpoint_id.fmt_short(), "sent transmit");
@@ -1360,7 +1291,7 @@ impl noq::UdpSender for Sender {
             contents: noq_transmit.contents,
             segment_size: noq_transmit.segment_size,
         };
-        let this = self.project();
+        let this = self.get_mut();
 
         match this.sender.poll_send(cx, &network_path, &transmit) {
             Poll::Ready(Ok(())) => {
@@ -1388,35 +1319,5 @@ impl noq::UdpSender for Sender {
 
     fn max_transmit_segments(&self) -> NonZeroUsize {
         self.max_transmit_segments
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    impl TransportsSender {
-        pub(in crate::socket) fn with_bounded_relay(
-            capacity: usize,
-            #[cfg(not(wasm_browser))] ip_configs: impl Iterator<Item = IpConfig>,
-        ) -> (
-            TransportsSender,
-            impl futures_util::Stream<Item = ()> + Unpin,
-        ) {
-            use futures_util::StreamExt;
-            let (sender, receiver) = RelaySender::bounded_for_test(capacity);
-            let sender = TransportsSender {
-                #[cfg(not(wasm_browser))]
-                ip: IpTransports::bind(ip_configs, &EndpointMetrics::default())
-                    .expect("test transports must bind")
-                    .create_sender(),
-                relay: vec![sender],
-                custom: Vec::new(),
-            };
-            (
-                sender,
-                tokio_stream::wrappers::ReceiverStream::new(receiver).map(|_| ()),
-            )
-        }
     }
 }
