@@ -41,14 +41,14 @@ pub(crate) struct RelayTransport {
 
 /// The receive half of a [`RelayTransport`], driven by its own noq socket task.
 #[derive(Debug)]
-pub(crate) struct RelayRecv {
+pub(crate) struct RelayReceiver {
     /// Queue to receive datagrams from relays for [`noq::AsyncUdpSocket::poll_recv`].
     relay_datagram_recv_queue: mpsc::Receiver<RelayRecvDatagram>,
     /// A datagram from the last poll_recv that didn't quite fit our buffers.
     pending_item: Option<RelayRecvDatagram>,
 }
 
-impl std::fmt::Display for RelayRecv {
+impl std::fmt::Display for RelayReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "RelayTransport")
     }
@@ -59,7 +59,7 @@ impl RelayTransport {
     pub(crate) fn new(
         config: RelayActorConfig,
         cancel_token: CancellationToken,
-    ) -> (Self, RelayRecv) {
+    ) -> (Self, RelayReceiver) {
         let (relay_datagram_send_tx, relay_datagram_send_rx) = mpsc::channel(256);
 
         let (relay_datagram_recv_tx, relay_datagram_recv_rx) = mpsc::channel(512);
@@ -87,7 +87,7 @@ impl RelayTransport {
             my_relay,
             my_endpoint_id,
         };
-        let recv = RelayRecv {
+        let recv = RelayReceiver {
             relay_datagram_recv_queue: relay_datagram_recv_rx,
             pending_item: None,
         };
@@ -101,7 +101,7 @@ impl RelayTransport {
     }
 }
 
-impl RelayRecv {
+impl RelayReceiver {
     pub(super) fn poll_recv(
         &mut self,
         cx: &mut Context,
@@ -228,7 +228,7 @@ impl RelayTransport {
     }
 }
 
-impl RelayRecv {
+impl RelayReceiver {
     /// Makes sure we have a pending item stored, if not, it'll poll a new one from the queue.
     ///
     /// Returns a mutable reference to the stored pending item.
@@ -419,7 +419,7 @@ mod tests {
 
     /// Builds a [`RelayTransport`] that never actually dials a relay (its home
     /// relay watcher is left unset), just so we get a real `poll_recv` to exercise.
-    fn test_relay_transport() -> (RelayTransport, RelayRecv) {
+    fn test_relay_transport() -> (RelayTransport, RelayReceiver) {
         let config = RelayActorConfig {
             my_relay: HomeRelayWatch::default(),
             secret_key: SecretKey::from_bytes(&[7u8; 32]),
